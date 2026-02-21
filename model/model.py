@@ -1,4 +1,4 @@
-from transformers import PretrainedConfig
+from transformers import Optional, PretrainedConfig
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -72,6 +72,7 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+import math
 
 # inherent from nn.Module class
 class RMSNorm(nn.Module):
@@ -89,3 +90,65 @@ class RMSNorm(nn.Module):
 # forward function to define the forward pass of the model
     def forward(self,x):
         return self.weight*self.norm(x.float()).type_as(x)*x
+    
+
+
+def precompute_rope_cis(dim:int, end:int=int(32*1024), rope_base:int=1e6, rope_scaling:Optional[dict]=None):
+    # RoPE function
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+
+    if rope_scaling is not None: 
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4),
+            rope_scaling.get("beta_slow", 1),
+        )
+
+        # calculate corr_dim
+        corr_dim = next(
+                    (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max),
+                    dim // 2,
+                ) # find the smallest i such that 2 * pi / freqs[i] > orig_max, if not found return dim // 2
+                # **why use next()?** because we only need the first i that satisfies the condition
+
+        # calculate power
+        power = torch.arrange(0,dim//2,device=freqs.device).float()/max(dim//2-1,1)
+
+        # calculate beta
+        beta = beta_slow+(beta_fast-beta_slow)*power
+
+        # calculate scale 
+        scale = torch.where(
+            torch.arange(dim//2,device=freqs.device)<corr_dim,
+            (beta*factor-beta+1)/(beta*factor),
+            1/factor
+        )
+
+        # apply scale
+        freqs = freqs*scale
+    
+    # generate position ids, and calculate the outer product of position ids and freqs
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+
+    # return the con and sin matraix
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    return freqs_cos, freqs_sin
+
+# apply YaRN (RoPE) to the input tensor
+
+def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
+    # **why need rotate_half?** because we need to rotate the second half of the input tensor, and keep the first half unchanged
+    def rotate_half(x): # [a,b] -> [-b,a]
+        # x.shape[-1]: the last dimension of x, which is the hidden size of the model
+        # x[..., x.shape[-1] // 2 :]: the second half of the input tensor
+        # x[..., : x.shape[-1] // 2]: the first half of the
+        return torch.cat(
+            (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
+        )
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    return q_embed, k_embed
+    
