@@ -23,7 +23,7 @@ import torch
 # v2 = torch.tensor([4.0, 5.0, 6.0])
 
 # result = torch.outer(v1, v2)
-# print(result) 
+# print(result)
 # # tensor([[ 4.,  5.,  6.],
 # #         [ 8., 10., 12.],
 # #         [12., 15., 18.]])
