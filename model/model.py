@@ -1,4 +1,10 @@
 from transformers import Optional, PretrainedConfig
+import torch
+import torch.nn as nn
+import math
+from typing import Optional, Tuple
+from torch import functional as F
+from transformers.activations import ACT2FN
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -69,13 +75,6 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
-
-
-import torch
-import torch.nn as nn
-import math
-from typing import Optional, Tuple
-from torch import functional as F
 
 
 # inherent from nn.Module class
@@ -328,10 +327,82 @@ class Attention(nn.Module):
                 scores @ xv
             )  # calculate the attention output by multiplying the attention weights with the value
 
+        # concatenate the output of all heads and apply a final linear transformation to get the output tensor
         output = output.transpose(1, 2).reshape(
             bsz, seq_len, -1
         )  # reshape the output back to [bsz, seq_len, hidden_size]
         output = self.resid_dropout(self.out_proj(output))  # apply the ResNet
         return output, pass_kv
 
-    # concatenate the output of all heads and apply a final linear transformation to get the output tensor
+
+class FeedForward(nn.Module):
+    # initialization
+    # elevate the dimension
+    # decrease the dimension
+    # gate
+    # dropout
+    # activation function
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(
+                args.hidden_size * 8 / 3
+            )  # 8/3 is a common ratio used in NN with gated activation
+            args.intermediate_size = (
+                64 * ((intermediate_size + 64 - 1) // 64)
+            )  # round up to the nearest multiple of 64 for better performance on GPU
+
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            args.intermediate_size, args.hidden_size, bias=False
+        )
+        self.gate_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=False
+        )
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
+
+
+class MokioMindBlock(nn.Module):
+    def __init__(self, Layer_id: int, config: MokioMindConfig):
+        super().__init__()
+        self.number_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+
+        self.layer_id = Layer_id
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embddings,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        residual = hidden_states
+        hidden_states, present_key_values = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_values
