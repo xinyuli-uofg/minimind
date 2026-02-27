@@ -2,9 +2,11 @@ from transformers import Optional, PretrainedConfig
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from torch import functional as F
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class MokioMindConfig(PretrainedConfig):
@@ -369,7 +371,9 @@ class FeedForward(nn.Module):
         return self.dropout(self.down_proj(gated))
 
 
-class MokioMindBlock(nn.Module):
+class MokioMindBlock(
+    nn.Module
+):  # this is actually a single transformer block, including a self-attention layer and a feedforward layer, with residual connections and layer normalization
     def __init__(self, Layer_id: int, config: MokioMindConfig):
         super().__init__()
         self.number_attention_heads = config.num_attention_heads
@@ -406,3 +410,135 @@ class MokioMindBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_values
+
+
+class MokioMindModel(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.vocab_size.self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embeded_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size
+        )
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList(
+            [MokioMindBlock(i, config) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # RoPE precomputation: precompute the RoPE cosine and sine values for the maximum position embeddings, and register them as buffers in the model so that they can be used during the forward pass without being updated during training.
+        freq_cos, freq_sin = precompute_rope_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer(
+            "freq_cos", freq_cos, persistent=False
+        )  # register_buffer is a method in nn.Module that allows you to register a tensor as a buffer, which means that it will be saved and loaded with the model, but it will not be considered as a model parameter and will not be updated during training. in this case, we register the precomputed RoPE cosine and sine values as buffers, so that they can be used during the forward pass without being updated during training.
+        self.register_buffer("freq_sin", freq_sin, persistent=False)
+
+        def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Tuple[torch.Tensor]] = None,
+            use_cache: bool = False,
+            **kwargs,
+        ):
+            batch_size, seq_len = input_ids.shape
+
+            if hasattr(past_key_values, "layers"):
+                past_key_values = None  # for backward compatibility (hugginface) with old checkpoints
+
+            past_key_values = (
+                past_key_values or [None] * len(self.layers)
+            )  # if past_key_values is None, create a list of None with the same length as the number of layers, otherwise use the provided past_key_values
+
+            start_pos = (
+                past_key_values[0][0].shape[1]
+                if past_key_values[0] is not None
+                else 0
+            )  # calculate the starting position for the current input based on the length of the past key values, if past_key_values is not None, get the shape of the first element (the key) of the first layer's past key values, and use the second dimension (the sequence length) as the starting position, otherwise start from 0 (no key value cache)
+
+            hidden_states = self.dropout(self.embeded_tokens(input_ids))
+            position_embddings = (
+                self.freq_cos[start_pos : start_pos + seq_len],
+                self.freq_sin[start_pos : start_pos + seq_len],
+            )
+            presents = []
+
+            for layer_idx, (layer, past_key_values) in enumerate(
+                zip(self.layers, past_key_values)
+            ):  # iterate through each transformer block (named as MokioMindBlock) and its corresponding past key values, and apply the forward pass of each block to the hidden states, while also passing the position embeddings and attention mask. collect the present key values for each layer in a list called presents, which will be used for caching during inference.
+                hidden_states, present = layer(
+                    hidden_states,
+                    position_embddings,
+                    past_key_value=past_key_values,
+                    use_cache=use_cache,
+                    attention_mask=attention_mask,
+                )
+                presents.append(
+                    present
+                )  # collect the present key values for each layer, which will be used for caching during inference
+
+            hidden_states = self.norm(
+                hidden_states
+            )  # apply layer normalization to the final hidden states after all transformer blocks
+            return hidden_states, presents
+
+
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # PreTrainedModel: a HugginFace's base class for all models in the transformers library, which provides common methods for loading and saving models, and handling model configurations. GenerationMixin: a mixin class that provides methods for generating text using the model, such as greedy decoding, beam search, etc.
+    # GenerationMixin is a HugginFace's mixin class that provides methods for generating text using the model, such as greedy decoding, beam search, etc. By inheriting from both PreTrainedModel and GenerationMixin, MokioMindForCausalLM can leverage the functionalities provided by both classes, allowing it to be easily loaded and saved using the PreTrainedModel's methods, and to generate text using the GenerationMixin's methods.
+    config_class = MokioMindConfig
+
+    def __init__(self, config: MokioMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = MokioMindModel(config)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )  # a linear layer that maps the hidden states to the vocabulary size, which will be used to generate the logits for each token in the vocabulary during the forward pass. The bias is set to False because we want to tie the weights of the lm_head with the input embedding layer, which is a common technique in language modeling to reduce the number of parameters and improve performance. By tying the weights, we ensure that the same weights are used for both the input embeddings and the output logits, which can help the model learn better representations and generate more coherent text.
+
+        # tie weights: tie (share) the weights of the lm_head with the input embedding layer, which is a common technique in language modeling to reduce the number of parameters and improve performance. By tying the weights, we ensure that the same weights are used for both the input embeddings and the output logits, which can help the model learn better representations and generate more coherent text.
+        self.model.embeded_tokens.weight
+
+        self.OUT = CausalLMOutputWithPast()  # a HugginFace's class that defines the output format for causal language modeling, which includes the logits for each token in the vocabulary, the past key values for caching during inference, and other optional outputs such as hidden states and attentions. By using this class, we can ensure that the output of the forward pass is compatible with the expected format for causal language modeling tasks, and can be easily used for generating text or calculating loss during training.
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[
+            int, torch.Tensor
+        ] = 0,  # for efficient inference with large vocabularies, we can keep only the top-k logits for each token, where k is specified by logits_to_keep. This can help reduce the computational cost and memory usage during inference, especially when the vocabulary size is large. If logits_to_keep is set to 0, it means that we keep all logits without any filtering.
+        **args,
+    ):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )  # if logits_to_keep is an integer, we create a slice object that keeps the last #N=logits_to_keep elements of the logits tensor, which corresponds to the top-k logits. If logits_to_keep is a tensor, we use it directly as the indices to keep in the logits tensor.
+        logits = self.lm_head(
+            hidden_states
+        )[
+            :, slice_indices, :
+        ]  # apply the lm_head linear layer to the hidden states to get the logits for each token in the vocabulary, and then slice the logits tensor to keep only the specified indices (top-k logits) for efficient inference with large vocabularies.
+
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("past_key_values", past_key_values)
+
+        return self.OUT
