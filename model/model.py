@@ -90,7 +90,7 @@ class RMSNorm(nn.Module):
 
     # _norm
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     # forward function to define the forward pass of the model
     def forward(self, x):
@@ -104,7 +104,9 @@ def precompute_rope_cis(
     rope_scaling: Optional[dict] = None,
 ):
     # RoPE function
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
+    freqs = 1.0 / (
+        rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+    )
 
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow = (
@@ -114,30 +116,35 @@ def precompute_rope_cis(
             rope_scaling.get("beta_slow", 1),
         )
 
-        # calculate corr_dim
-        corr_dim = next(
-            (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max),
-            dim // 2,
-        )  # find the smallest i such that 2 * pi / freqs[i] > orig_max, if not found return dim // 2
-        # **why use next()?** because we only need the first i that satisfies the condition
+        if end / orig_max > 1.0:
+            # calculate corr_dim
+            corr_dim = next(
+                (
+                    i
+                    for i in range(dim // 2)
+                    if 2 * math.pi / freqs[i] > orig_max
+                ),
+                dim // 2,
+            )  # find the smallest i such that 2 * pi / freqs[i] > orig_max, if not found return dim // 2
+            # **why use next()?** because we only need the first i that satisfies the condition
 
-        # calculate power
-        power = torch.arrange(0, dim // 2, device=freqs.device).float() / max(
-            dim // 2 - 1, 1
-        )
+            # calculate power
+            power = torch.arrange(
+                0, dim // 2, device=freqs.device
+            ).float() / max(dim // 2 - 1, 1)
 
-        # calculate beta
-        beta = beta_slow + (beta_fast - beta_slow) * power
+            # calculate beta
+            beta = beta_slow + (beta_fast - beta_slow) * power
 
-        # calculate scale
-        scale = torch.where(
-            torch.arange(dim // 2, device=freqs.device) < corr_dim,
-            (beta * factor - beta + 1) / (beta * factor),
-            1 / factor,
-        )
+            # calculate scale
+            scale = torch.where(
+                torch.arange(dim // 2, device=freqs.device) < corr_dim,
+                (beta * factor - beta + 1) / (beta * factor),
+                1 / factor,
+            )
 
-        # apply scale
-        freqs = freqs * scale
+            # apply scale
+            freqs = freqs * scale
 
     # generate position ids, and calculate the outer product of position ids and freqs
     t = torch.arange(end, device=freqs.device)
@@ -415,6 +422,7 @@ class MokioMindBlock(
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size.self.num_hidden_layers = (
             config.vocab_size,
             config.num_hidden_layers,
@@ -470,13 +478,13 @@ class MokioMindModel(nn.Module):
             )
             presents = []
 
-            for layer_idx, (layer, past_key_values) in enumerate(
+            for layer_idx, (layer, past_key_value) in enumerate(
                 zip(self.layers, past_key_values)
             ):  # iterate through each transformer block (named as MokioMindBlock) and its corresponding past key values, and apply the forward pass of each block to the hidden states, while also passing the position embeddings and attention mask. collect the present key values for each layer in a list called presents, which will be used for caching during inference.
                 hidden_states, present = layer(
                     hidden_states,
                     position_embddings,
-                    past_key_value=past_key_values,
+                    past_key_value=past_key_value,
                     use_cache=use_cache,
                     attention_mask=attention_mask,
                 )
@@ -505,8 +513,6 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         # tie weights: tie (share) the weights of the lm_head with the input embedding layer, which is a common technique in language modeling to reduce the number of parameters and improve performance. By tying the weights, we ensure that the same weights are used for both the input embeddings and the output logits, which can help the model learn better representations and generate more coherent text.
         self.model.embeded_tokens.weight
-
-        self.OUT = CausalLMOutputWithPast()  # a HugginFace's class that defines the output format for causal language modeling, which includes the logits for each token in the vocabulary, the past key values for caching during inference, and other optional outputs such as hidden states and attentions. By using this class, we can ensure that the output of the forward pass is compatible with the expected format for causal language modeling tasks, and can be easily used for generating text or calculating loss during training.
 
     def forward(
         self,
@@ -537,8 +543,8 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
             :, slice_indices, :
         ]  # apply the lm_head linear layer to the hidden states to get the logits for each token in the vocabulary, and then slice the logits tensor to keep only the specified indices (top-k logits) for efficient inference with large vocabularies.
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("logits", logits)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
